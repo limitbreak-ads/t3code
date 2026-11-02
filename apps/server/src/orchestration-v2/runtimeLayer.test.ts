@@ -6829,6 +6829,23 @@ it.layer(layerScratchPromotionTest)("turning a No project thread into a project"
         creationSource: "web",
       });
 
+      const previous = process.env.T3CODE_MCP_SAME_PROJECT_ONLY;
+      process.env.T3CODE_MCP_SAME_PROJECT_ONLY = "1";
+      try {
+        const refused = yield* promotion.promote({ threadId }).pipe(Effect.flip);
+        assert.match(refused.message, /pinned.*same-project only/);
+        assert.isTrue(Option.isNone(yield* projects.getByWorkspaceRoot(folder)));
+        for (const id of [threadId, siblingId]) {
+          assert.equal((yield* shellOf(id))?.projectId, SCRATCH_PROJECT_ID);
+        }
+        assert.equal(
+          (yield* tasks.list()).tasks.find((current) => current.id === task.id)?.projectId,
+          SCRATCH_PROJECT_ID,
+        );
+      } finally {
+        if (previous === undefined) delete process.env.T3CODE_MCP_SAME_PROJECT_ONLY;
+        else process.env.T3CODE_MCP_SAME_PROJECT_ONLY = previous;
+      }
       const { projectId } = yield* promotion.promote({ threadId });
 
       const project = yield* projects.getById(projectId);

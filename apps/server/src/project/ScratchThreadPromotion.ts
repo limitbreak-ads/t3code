@@ -57,6 +57,11 @@ const make = Effect.gen(function* () {
   const promote: ScratchThreadPromotion["Service"]["promote"] = Effect.fn(
     "ScratchThreadPromotion.promote",
   )(function* (input) {
+    if (process.env.T3CODE_MCP_SAME_PROJECT_ONLY === "1") {
+      return yield* new ScratchThreadPromotionError({
+        reason: "Threads are pinned to their projects; same-project only",
+      });
+    }
     const thread = yield* threads.getThreadShell(input.threadId).pipe(
       Effect.mapError(fail("Could not read the thread.")),
       Effect.filterOrFail(

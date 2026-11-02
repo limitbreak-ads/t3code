@@ -23,6 +23,7 @@ import {
 import * as ProjectAccess from "../orchestration-v2/ProjectAccessScope.ts";
 import * as ScheduledTasks from "../scheduledTasks/ScheduledTaskService.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
+import { sameProjectReferences } from "./sameProjectReferences.ts";
 import { assertNotLinked, assertSameLink, callerLinkOrigin } from "./linkOrigin.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import { resolveInteractionMode, resolveRuntimeMode } from "./delegatedTaskModes.ts";
@@ -380,7 +381,7 @@ const sameProjectDenied = () =>
 const sameProjectParams = Effect.fn("McpToolAccess.sameProjectParams")(function* (
   name: string,
   params: object,
-  result = false,
+  resolveTasks = true,
 ) {
   const boundary = yield* ProjectAccess.ProjectAccessScope;
   if (boundary === undefined) return params;
@@ -407,7 +408,7 @@ const sameProjectParams = Effect.fn("McpToolAccess.sameProjectParams")(function*
     scheduled: boolean,
   ) {
     const scheduler = yield* Effect.serviceOption(ScheduledTasks.ScheduledTaskService);
-    if (Option.isSome(scheduler)) {
+    if (scheduled && Option.isSome(scheduler)) {
       const { tasks } = yield* scheduler.value.list().pipe(Effect.mapError(sameProjectDenied));
       const task = tasks.find((task) => task.id === id);
       if (task !== undefined) {
@@ -426,47 +427,18 @@ const sameProjectParams = Effect.fn("McpToolAccess.sameProjectParams")(function*
     if (task === undefined || task.remoteChild !== undefined) return yield* sameProjectDenied();
     if (task.childThreadId !== null) yield* assertThread(task.childThreadId);
   });
-  // Resolve references recursively, including nested batch targets; new tools inherit this check.
-  const check = Effect.fn("McpToolAccess.sameProjectReferences")(function* (
-    value: unknown,
-  ): Effect.fn.Return<void, OrchestratorMcpFailure> {
-    if (Array.isArray(value)) {
-      for (const item of value) yield* check(item);
-    } else if (typeof value === "object" && value !== null) {
-      for (const [key, target] of Object.entries(value)) {
-        if (target === undefined || target === null) continue;
-        if (key === "scratch" && target === true) return yield* sameProjectDenied();
-        if (key === "environmentId") {
-          if (
-            typeof target !== "string" ||
-            PeerForwarding.remoteTarget(scope, target as EnvironmentId) !== undefined
-          )
-            return yield* sameProjectDenied();
-        } else if (key === "projectId") {
-          if (target !== projectId) return yield* sameProjectDenied();
-        } else if (/^(?:threadId|.*ThreadId)$/.test(key)) {
-          if (typeof target !== "string") return yield* sameProjectDenied();
-          yield* assertThread(target);
-        } else if (/^(?:threadIds|.*ThreadIds)$/.test(key)) {
-          if (!Array.isArray(target)) return yield* sameProjectDenied();
-          for (const id of target) {
-            if (typeof id !== "string") return yield* sameProjectDenied();
-            yield* assertThread(id);
-          }
-        } else if (!result && (key === "scheduledTaskId" || key === "taskId")) {
-          if (typeof target !== "string") return yield* sameProjectDenied();
-          yield* assertTask(target, key === "scheduledTaskId" || name === "run_scheduled_task_now");
-        } else if (!result && key === "taskIds") {
-          if (!Array.isArray(target)) return yield* sameProjectDenied();
-          for (const id of target) {
-            if (typeof id !== "string") return yield* sameProjectDenied();
-            yield* assertTask(id, false);
-          }
-        } else yield* check(target);
-      }
-    }
-  });
-  yield* check(scoped);
+  for (const target of sameProjectReferences(name, scoped)) {
+    if (target.scratch === true) return yield* sameProjectDenied();
+    if (PeerForwarding.remoteTarget(scope, target.environmentId) !== undefined)
+      return yield* sameProjectDenied();
+    if (target.projectId !== undefined && target.projectId !== projectId)
+      return yield* sameProjectDenied();
+    for (const threadId of target.threadIds ?? []) yield* assertThread(threadId);
+    if (resolveTasks && target.scheduledTaskId !== undefined)
+      yield* assertTask(target.scheduledTaskId, true);
+    if (resolveTasks && target.delegatedTaskId !== undefined)
+      yield* assertTask(target.delegatedTaskId, false);
+  }
   return scoped;
 });
 
@@ -521,11 +493,7 @@ const routed = Effect.fn("McpToolAccess.routed")(function* <Tools extends Record
         const refused = yield* Ref.make(false);
         return yield* sameProjectParams(name, params).pipe(
           Effect.flatMap((scoped) =>
-            handle(scoped).pipe(
-              Effect.tap((result) =>
-                sameProjectParams("result", { arguments: scoped, result }, true),
-              ),
-            ),
+            handle(scoped).pipe(Effect.tap(() => sameProjectParams(name, scoped, false))),
           ),
           Effect.matchEffect({
             onFailure: (error) =>

@@ -9,11 +9,19 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
+  ScheduledTaskId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Exit from "effect/Exit";
+import * as TestClock from "effect/testing/TestClock";
+import * as ThreadLaunch from "../orchestration-v2/ThreadLaunchService.ts";
+import * as Scheduler from "../scheduling/Scheduler.ts";
+import * as SecretRequests from "../secrets/SecretRequests.ts";
+import * as ManagedFolders from "../project/ManagedProjectFolders.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
@@ -199,20 +207,21 @@ it.layer(layerOrchestrator)("writesThreads against a mode raise", (it) => {
 });
 
 it.layer(layerOrchestrator)("production project move race", (it) => {
-  it.effect.each([false, true])(
-    "checks the project under the dispatch lock after preflight: moved=%s",
-    (moved) =>
+  it.effect.each(["none", "legacy-target", "caller", "target"] as const)(
+    "checks project pinning and dispatch locking after preflight: move=%s",
+    (move) =>
       Effect.gen(function* () {
+        const moved = move === "legacy-target";
         const previous = process.env.T3CODE_MCP_SAME_PROJECT_ONLY;
         process.env.T3CODE_MCP_SAME_PROJECT_ONLY = "1";
         try {
           const orchestrator = yield* Orchestrator.OrchestratorV2;
           const threads = yield* ThreadManagement.ThreadManagementService;
           const projects = yield* ProjectStore.ProjectStoreV2;
-          const callerId = ThreadId.make(`caller:${moved}`);
-          const targetId = ThreadId.make(`target:${moved}`);
+          const callerId = ThreadId.make(`caller:${move}`);
+          const targetId = ThreadId.make(`target:${move}`);
           const ownProject = ProjectId.make("project:mcp-race");
-          const foreignProject = ProjectId.make(`foreign:${moved}`);
+          const foreignProject = ProjectId.make(`foreign:${move}`);
           for (const projectId of [ownProject, foreignProject]) {
             const at = "2026-03-24T00:00:00.000Z";
             yield* projects.apply({
@@ -249,7 +258,27 @@ it.layer(layerOrchestrator)("production project move race", (it) => {
             dispatch: (command) =>
               Effect.gen(function* () {
                 dispatched = true;
-                if (moved)
+                if (move === "caller" || move === "target") {
+                  const id = move === "caller" ? callerId : targetId;
+                  const attempt = yield* orchestrator
+                    .dispatch({
+                      type: "thread.project.adopt-folder",
+                      commandId: CommandId.make(`move:${id}`),
+                      threadId: id,
+                      projectId: foreignProject,
+                    })
+                    .pipe(
+                      Effect.provideService(ProjectAccess.ProjectAccessScope, undefined),
+                      Effect.provideService(DispatchModeLimit, undefined),
+                      Effect.result,
+                    );
+                  assert.equal(attempt._tag, "Failure");
+                  if (attempt._tag === "Failure")
+                    assert.match(String(attempt.failure.cause), /pinned.*same-project only/);
+                  assert.equal((yield* threads.getThreadShell(id))?.projectId, ownProject);
+                }
+                if (moved) {
+                  delete process.env.T3CODE_MCP_SAME_PROJECT_ONLY;
                   yield* orchestrator
                     .dispatch({
                       type: "thread.project.adopt-folder",
@@ -261,6 +290,8 @@ it.layer(layerOrchestrator)("production project move race", (it) => {
                       Effect.provideService(ProjectAccess.ProjectAccessScope, undefined),
                       Effect.provideService(DispatchModeLimit, undefined),
                     );
+                  process.env.T3CODE_MCP_SAME_PROJECT_ONLY = "1";
+                }
                 return yield* threads.dispatch(command);
               }),
           });
@@ -318,5 +349,118 @@ it.layer(layerOrchestrator)("production project move race", (it) => {
           ),
         ),
       ),
+  );
+});
+
+it.layer(layerOrchestrator)("project pinning and deferred schedules", (it) => {
+  it.effect.each(["1", "0", undefined])("project moves with toggle %s", (toggle) =>
+    Effect.gen(function* () {
+      const previous = process.env.T3CODE_MCP_SAME_PROJECT_ONLY;
+      if (toggle === undefined) delete process.env.T3CODE_MCP_SAME_PROJECT_ONLY;
+      else process.env.T3CODE_MCP_SAME_PROJECT_ONLY = toggle;
+      try {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const projects = yield* ProjectStore.ProjectStoreV2;
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const ownProject = ProjectId.make("project:mcp-race");
+        const foreignProject = ProjectId.make(`destination:${toggle}`);
+        const threadId = ThreadId.make(`scheduled:${toggle}`);
+        for (const projectId of [ownProject, foreignProject]) {
+          const at = "2026-03-24T00:00:00.000Z";
+          yield* projects.apply({
+            sequence: 1,
+            eventId: EventId.make(`project:${projectId}`),
+            aggregateKind: "project",
+            aggregateId: projectId,
+            occurredAt: at,
+            commandId: null,
+            causationEventId: null,
+            correlationId: null,
+            metadata: {},
+            type: "project.created",
+            payload: {
+              projectId,
+              title: "Project",
+              workspaceRoot: "/workspace",
+              defaultModelSelection: null,
+              scripts: [],
+              createdAt: at,
+              updatedAt: at,
+            },
+          });
+        }
+        yield* createSupervisedThread(threadId);
+        const sent = yield* Ref.make<ProjectId[]>([]);
+        const tick = yield* Ref.make(Effect.void);
+        const schedulerLayer = ScheduledTasks.layer.pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              ManagedPolicy.layerTest(),
+              NodeCrypto.layer,
+              Layer.succeed(Scheduler.Scheduler, {
+                register: (name, work) =>
+                  Effect.gen(function* () {
+                    const context = yield* Effect.context<Effect.Services<typeof work>>();
+                    if (name === "scheduled-tasks")
+                      yield* Ref.set(tick, work.pipe(Effect.provideContext(context), Effect.orDie));
+                  }),
+              }),
+              Layer.mock(SecretRequests.SecretRequests)({}),
+              Layer.mock(ManagedFolders.ManagedProjectFolders)({
+                namedProjectsRoot: "/projects",
+                isScratchProject: () => Effect.succeed(false),
+              }),
+              Layer.mock(ThreadLaunch.ThreadLaunchService)({}),
+              Layer.mock(ThreadManagement.ThreadManagementService)({
+                getThreadShell: (id) => orchestrator.getThreadShell(id),
+                sendToThread: (input) =>
+                  Ref.update(sent, (ids) => [...ids, input.projectId]).pipe(Effect.as({} as never)),
+              }),
+            ),
+          ),
+        );
+        yield* Effect.gen(function* () {
+          const scheduler = yield* ScheduledTasks.ScheduledTaskService;
+          const { task } = yield* scheduler.upsert({
+            id: ScheduledTaskId.make(`scheduled-task:${toggle}`),
+            projectId: ownProject,
+            threadId,
+            title: "Deferred",
+            prompt: "Check",
+            enabled: true,
+            schedule: { type: "interval", everyMs: 60000 },
+            workspaceStrategy: { type: "root" },
+            modelSelection: { instanceId, model: "gpt-5" },
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+          });
+          const move = yield* orchestrator
+            .dispatch({
+              type: "thread.project.adopt-folder",
+              commandId: CommandId.make(`adopt:${toggle}`),
+              threadId,
+              projectId: foreignProject,
+            })
+            .pipe(Effect.exit);
+          assert.equal(Exit.isFailure(move), toggle === "1");
+          const shell = yield* projections.getThreadShell(threadId);
+          assert.equal(shell?.projectId, toggle === "1" ? ownProject : foreignProject);
+          if (toggle === "1") {
+            assert.equal(yield* ProjectAccess.ProjectAccessScope, undefined);
+            yield* TestClock.adjust("60 seconds");
+            yield* Effect.flatten(Ref.get(tick));
+            assert.deepEqual(yield* Ref.get(sent), [ownProject]);
+            const saved = (yield* scheduler.list()).tasks.find((current) => current.id === task.id);
+            assert.equal(saved?.runCount, 1);
+            assert.equal(saved?.lastRunStatus, "succeeded");
+            assert.equal(saved?.projectId, ownProject);
+            assert.equal(saved?.threadId, threadId);
+          }
+        }).pipe(Effect.provide(schedulerLayer));
+      } finally {
+        if (previous === undefined) delete process.env.T3CODE_MCP_SAME_PROJECT_ONLY;
+        else process.env.T3CODE_MCP_SAME_PROJECT_ONLY = previous;
+      }
+    }),
   );
 });

@@ -13,6 +13,8 @@ import {
   ProviderInstanceId,
   ScheduledTask,
   ThreadId,
+  RuntimeRequestId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -137,6 +139,48 @@ const client = McpSchema.McpServerClient.of({
 });
 const fixture = (caller: typeof own | null = own) => {
   const effects: string[] = [];
+  const answers = {
+    projectId: "answer-project",
+    taskId: "answer-task",
+    nested: { threadId: "answer-thread" },
+  };
+  const questionProjection = (id: ThreadId) => ({
+    ...idleThreadProjection(shells.find((s) => s.id === id) ?? own),
+    runtimeRequests: [
+      {
+        id: RuntimeRequestId.make("question"),
+        nodeId: NodeId.make("root"),
+        providerTurnId: null,
+        nativeRequestRef: null,
+        kind: "user_input" as const,
+        status: "pending" as const,
+        responseCapability: { type: "message" as const },
+        createdAt: own.createdAt,
+        resolvedAt: null,
+      },
+    ],
+    turnItems: [
+      {
+        id: TurnItemId.make("question-item"),
+        threadId: id,
+        runId: null,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 0,
+        status: "completed" as const,
+        title: null,
+        startedAt: own.createdAt,
+        completedAt: own.updatedAt,
+        updatedAt: own.updatedAt,
+        type: "user_input_request" as const,
+        requestId: RuntimeRequestId.make("question"),
+        questions: [],
+      },
+    ],
+  });
   const threads = Layer.mock(ThreadManagement.ThreadManagementService)({
     getThreadShell: (id) =>
       Effect.succeed(id === own.id ? caller : (shells.find((s) => s.id === id) ?? null)),
@@ -145,16 +189,26 @@ const fixture = (caller: typeof own | null = own) => {
         ...idleThreadProjection(shells.find((s) => s.id === id) ?? own),
         subagents: id === own.id ? [delegated("moved-child"), delegated("remote-child", true)] : [],
       }),
-    getProjectThreadRecords: ({ threadId }) =>
-      Effect.succeed(idleThreadProjection(shells.find((s) => s.id === threadId) ?? own)),
+    getProjectThreadRecords: ({ threadId }) => Effect.succeed(questionProjection(threadId)),
     listProjectThreads: ({ projectId }) =>
       Effect.succeed(
         shells.filter(
           (s) => s.deletedAt === null && (projectId === undefined || s.projectId === projectId),
         ),
       ),
-    dispatch: () =>
+    awaitBackgroundTasks: (input) =>
       Effect.sync(() => {
+        expect(input).toEqual({
+          threadId: own.id,
+          taskIds: ["provider:background-123"],
+          awaited: true,
+        });
+        effects.push("background");
+        return { matched: input.taskIds, unmatched: [] };
+      }),
+    dispatch: (command) =>
+      Effect.sync(() => {
+        if (command.type === "runtime-request.respond") expect(command.answers).toEqual(answers);
         effects.push("dispatch");
         return { sequence: 7, storedEvents: [] };
       }),
@@ -264,7 +318,7 @@ const fixture = (caller: typeof own | null = own) => {
       Layer.provide(NodeCrypto.layer),
       Layer.provide(NodeServices.layer),
     );
-  return { layer, effects };
+  return { layer, effects, answers };
 };
 const call = (name: string, args: Record<string, unknown>, external = false) =>
   McpServer.McpServer.pipe(
@@ -544,5 +598,36 @@ it.effect.each(["t3_thread_send_attachments", "t3_workflow_stop"])(
         yield* withToggle("0", call(name, args)),
       );
     }).pipe(Effect.provide(f.layer));
+  },
+);
+
+it.effect.each(["background", "answers"])(
+  "production payload is not a resource reference: %s",
+  (kind) => {
+    const f = fixture();
+    return withToggle(
+      "1",
+      Effect.gen(function* () {
+        if (kind === "background") {
+          const background = yield* call("t3_background_wait", {
+            taskIds: ["provider:background-123"],
+          });
+          expect(background.isError).toBe(false);
+          expect(background.structuredContent).toEqual({
+            matched: ["provider:background-123"],
+            unmatched: [],
+          });
+          expect(f.effects).toEqual(["background"]);
+        } else {
+          const response = yield* call("t3_pending_request", {
+            action: "respond",
+            requestId: "question",
+            answers: f.answers,
+          });
+          expect(response.isError).toBe(false);
+          expect(f.effects).toEqual(["dispatch"]);
+        }
+      }),
+    ).pipe(Effect.provide(f.layer));
   },
 );

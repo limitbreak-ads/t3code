@@ -4245,6 +4245,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ),
       );
     const thread = projection.thread;
+    if (
+      process.env.T3CODE_MCP_SAME_PROJECT_ONLY === "1" &&
+      thread.projectId !== command.projectId
+    ) {
+      return yield* reject("is pinned to its project; same-project only");
+    }
     if (thread.deletedAt !== null) return yield* reject("is deleted.");
     if (threadHasUnfinishedWork(projection)) {
       return yield* reject("still has work in progress. Finish or stop it first.");
