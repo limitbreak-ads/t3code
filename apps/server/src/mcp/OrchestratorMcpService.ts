@@ -1,3 +1,4 @@
+import * as ProjectAccess from "../orchestration-v2/ProjectAccessScope.ts";
 import {
   CommandId,
   type RunId,
@@ -1170,6 +1171,14 @@ const make = Effect.gen(function* () {
     const shell = yield* threadManagement
       .getThreadShell(threadId)
       .pipe(Effect.mapError(threadManagementFailure));
+    if (
+      !(yield* ProjectAccess.allowsProject(shell?.deletedAt === null ? shell.projectId : undefined))
+    ) {
+      return yield* failure(
+        "capability_denied",
+        "The requested target is unavailable in this project; same-project only",
+      );
+    }
     if (shell === null || shell.deletedAt !== null) {
       return yield* threadNotFound(threadManagement, threadId, `Thread ${threadId} was not found.`);
     }
@@ -1475,6 +1484,9 @@ const make = Effect.gen(function* () {
         "task_not_found",
         `Delegated task ${taskId} does not belong to thread ${scope.thread.threadId}.`,
       );
+    }
+    if ((yield* ProjectAccess.ProjectAccessScope) !== undefined && task.remoteChild !== undefined) {
+      return yield* failure("capability_denied", "The requested task is remote; same-project only");
     }
     if (task.childThreadId === null) {
       return yield* readRemoteTask(scope, task, waitTimedOut, acknowledgeTerminal);
@@ -1938,6 +1950,19 @@ const make = Effect.gen(function* () {
    * broader than the caller's own, so editing its prompt cannot run work above
    * the caller's limits.
    */
+  const scheduledTaskInProject = Effect.fn("OrchestratorMcpService.scheduledTaskInProject")(
+    function* (task: ScheduledTask) {
+      const boundary = yield* ProjectAccess.ProjectAccessScope;
+      if (boundary === undefined) return true;
+      if (task.projectId !== boundary.projectId) return false;
+      if (task.threadId === null) return true;
+      const bound = yield* threadManagement
+        .getThreadShell(task.threadId)
+        .pipe(Effect.orElseSucceed(() => null));
+      return bound !== null && bound.deletedAt === null && bound.projectId === boundary.projectId;
+    },
+  );
+
   const loadScheduledTask = Effect.fn("OrchestratorMcpService.loadScheduledTask")(function* (
     scheduledTaskId: ScheduledTask["id"],
     limits: {
@@ -1956,6 +1981,11 @@ const make = Effect.gen(function* () {
     if (task === undefined) {
       return yield* failure("task_not_found", `Scheduled task ${scheduledTaskId} was not found.`);
     }
+    if (!(yield* scheduledTaskInProject(task)))
+      return yield* failure(
+        "capability_denied",
+        "The requested task is unavailable in this project; same-project only",
+      );
     for (const modes of yield* scheduledTaskRunModes(task)) {
       yield* resolveRuntimeMode(limits.runtimeMode, modes.runtimeMode);
       yield* resolveInteractionMode(limits.interactionMode, modes.interactionMode);
@@ -1967,6 +1997,11 @@ const make = Effect.gen(function* () {
     scheduleTask: Effect.fn("OrchestratorMcpService.scheduleTask")(function* (scope, input) {
       const { parent, limits } = yield* loadCaller(scope);
       const projectId = yield* resolveProjectTarget(parent, input.projectId);
+      if (!(yield* ProjectAccess.allowsProject(projectId)))
+        return yield* failure(
+          "capability_denied",
+          "The requested project is unavailable; same-project only",
+        );
       yield* assertLiveCallerForOtherProject(scope, parent, projectId);
       const project = yield* requireProject(projectId);
       const bindToCurrentThread =
@@ -2032,7 +2067,10 @@ const make = Effect.gen(function* () {
           );
         return {
           tasks: yield* Effect.forEach(
-            tasks.filter((task) => projectId === undefined || task.projectId === projectId),
+            yield* Effect.filter(
+              tasks.filter((task) => projectId === undefined || task.projectId === projectId),
+              scheduledTaskInProject,
+            ),
             (task) => summarizeScheduledTask(scope, { parent, limits }, task),
           ),
         };
@@ -3190,6 +3228,10 @@ const make = Effect.gen(function* () {
             type: "thread.stop",
             commandId,
             threadId: input.threadId,
+            // Scoped stops walk descendants synchronously below, retaining the project boundary.
+            ...((yield* ProjectAccess.ProjectAccessScope) === undefined
+              ? {}
+              : { stopDelegatedTasks: false }),
             ...(input.reason === undefined ? {} : { reason: input.reason }),
           })
           .pipe(Effect.catch(stopFailed));

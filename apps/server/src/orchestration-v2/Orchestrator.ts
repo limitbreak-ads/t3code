@@ -21,6 +21,7 @@ import {
 import {
   ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
   type ChatAttachment,
+  type ProjectId,
   CommandId,
   type GuestMessageId,
   isCompactionCommandMessage,
@@ -140,6 +141,7 @@ import * as EffectOutbox from "./EffectOutbox.ts";
 import { withCommandMetrics } from "../observability/Metrics.ts";
 import type { OrchestrationEffectRequestV2, PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as ProjectAccess from "./ProjectAccessScope.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import {
   DispatchModeLimit,
@@ -4277,8 +4279,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       modes: {
         readonly runtimeMode: RuntimeMode;
         readonly interactionMode: ProviderInteractionMode;
+        readonly projectId: ProjectId;
       },
     ) {
+      if (!(yield* ProjectAccess.allowsProject(modes.projectId))) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "same-project only",
+        });
+      }
       const limit = narrowToCeiling(yield* DispatchModeLimit, runtimeModeCeiling);
       const exceeded = limit === undefined ? undefined : exceededDispatchModeLimit(limit, modes);
       if (limit === undefined || exceeded === undefined) return;
@@ -13336,6 +13346,57 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       "orchestration_v2.thread_id": commandThreadId(command),
     });
 
+    const projectScope = yield* ProjectAccess.ProjectAccessScope;
+    if (projectScope !== undefined) {
+      if (command.type.startsWith("delegated_task.remote.")) {
+        yield* Ref.set(projectScope.refused, true);
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "same-project only",
+        });
+      }
+      // This runs under the target lock, before receipt replay or any queue/dispatch side effect.
+      const check = Effect.fn("OrchestratorV2.checkDispatchProject")(function* (
+        threadId: ThreadId,
+        creating = false,
+      ) {
+        const shell = yield* projectionStore
+          .getThreadShell(threadId)
+          .pipe(mapDispatchError(command));
+        if (creating && shell === null) return;
+        if (
+          !(yield* ProjectAccess.allowsProject(
+            shell?.deletedAt === null ? shell.projectId : undefined,
+          ))
+        ) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: "same-project only",
+          });
+        }
+      });
+      yield* check(projectScope.callerThreadId);
+      for (const [key, value] of Object.entries(command)) {
+        if (typeof value !== "string") continue;
+        if (key === "projectId" && !(yield* ProjectAccess.allowsProject(value as ProjectId))) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: "same-project only",
+          });
+        }
+        if (/^(?:threadId|.*ThreadId)$/.test(key)) {
+          yield* check(
+            ThreadId.make(value),
+            (key === "threadId" && command.type === "thread.create") ||
+              (key === "targetThreadId" && command.type === "thread.fork"),
+          );
+        }
+      }
+    }
+
     const existingReceipt = yield* commandReceipts.getByCommandId(command.commandId).pipe(
       Effect.mapError(
         (cause) =>
@@ -13898,6 +13959,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const shellProjectionError = (cause: unknown) =>
     new OrchestratorProjectionError({ threadId: ThreadId.make("thread:shell"), cause });
 
+  const assertReadableProject = Effect.fn("OrchestratorV2.assertReadableProject")(function* (
+    thread: Pick<OrchestrationV2AppThread, "id" | "projectId" | "deletedAt">,
+  ) {
+    if (
+      !(yield* ProjectAccess.allowsProject(
+        thread.deletedAt === null ? thread.projectId : undefined,
+      ))
+    ) {
+      return yield* new OrchestratorProjectionError({
+        threadId: thread.id,
+        cause: "same-project only",
+      });
+    }
+  });
+
   return OrchestratorV2.of({
     resumeQueuedRuns,
     recoverDelegatedTasks,
@@ -13988,15 +14064,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     }),
     getThreadRecords: Effect.fn("OrchestratorV2.getThreadRecords")(
       function (threadId, fields, filter) {
-        return projectionStore
-          .getThreadRecords(threadId, fields, filter)
-          .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
+        return projectionStore.getThreadRecords(threadId, fields, filter).pipe(
+          Effect.tap((projection) => assertReadableProject(projection.thread)),
+          Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
+        );
       },
     ),
     getThreadProjection: Effect.fn("OrchestratorV2.getThreadProjection")(function (threadId) {
-      return projectionStore
-        .getThreadProjection(threadId)
-        .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
+      return projectionStore.getThreadProjection(threadId).pipe(
+        Effect.tap((projection) => assertReadableProject(projection.thread)),
+        Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
+      );
     }),
     getCheckpointContext: Effect.fn("OrchestratorV2.getCheckpointContext")(function (threadId) {
       return projectionStore
@@ -14004,15 +14082,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
     }),
     getThreadSnapshot: Effect.fn("OrchestratorV2.getThreadSnapshot")(function (threadId) {
-      return projectionStore
-        .getThreadSnapshot(threadId)
-        .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
+      return projectionStore.getThreadSnapshot(threadId).pipe(
+        Effect.tap((projection) => assertReadableProject(projection.projection.thread)),
+        Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
+      );
     }),
     getThreadSnapshotWindow: Effect.fn("OrchestratorV2.getThreadSnapshotWindow")(
       function (threadId, options) {
-        return projectionStore
-          .getThreadSnapshotWindow(threadId, options)
-          .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
+        return projectionStore.getThreadSnapshotWindow(threadId, options).pipe(
+          Effect.tap((projection) => assertReadableProject(projection.projection.thread)),
+          Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
+        );
       },
     ),
     getShellSnapshot: Effect.fn("OrchestratorV2.getShellSnapshot")(function (options) {

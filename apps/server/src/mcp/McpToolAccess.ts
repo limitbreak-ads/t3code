@@ -3,10 +3,9 @@ import {
   type OrchestrationV2LinkOrigin,
   OrchestratorMcpEnvironmentTarget,
   OrchestratorMcpFailure,
-  type ProjectId,
   type ProviderInteractionMode,
   type RuntimeMode,
-  type ThreadId,
+  ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -21,6 +20,8 @@ import {
   DispatchModeLimit,
   type DispatchModeRefusal,
 } from "../orchestration-v2/DispatchModeLimit.ts";
+import * as ProjectAccess from "../orchestration-v2/ProjectAccessScope.ts";
+import * as ScheduledTasks from "../scheduledTasks/ScheduledTaskService.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import { assertNotLinked, assertSameLink, callerLinkOrigin } from "./linkOrigin.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
@@ -370,80 +371,103 @@ const linksUnavailable = new OrchestratorMcpFailure({
   message: "This environment cannot reach linked environments.",
 });
 
-const sameProjectTools = new Set([
-  "t3_thread_send",
-  "t3_thread_update",
-  "t3_thread_interrupt",
-  "t3_thread_read",
-  "t3_thread_list",
-  "t3_thread_search",
-  "t3_thread_wait",
-  "t3_thread_launch",
-  "create_threads",
-  "delegate_task",
-]);
-
-type ProjectTarget = {
-  readonly projectId?: ProjectId | undefined;
-  readonly environmentId?: EnvironmentId | undefined;
-};
-
-type SameProjectParams = ProjectTarget & {
-  readonly threadId?: ThreadId | undefined;
-  readonly scratch?: boolean | undefined;
-  readonly target?: ProjectTarget | undefined;
-  readonly threads?: ReadonlyArray<{ readonly target?: ProjectTarget | undefined }> | undefined;
-};
+const sameProjectDenied = () =>
+  new OrchestratorMcpFailure({
+    code: "capability_denied",
+    message: "The requested target is unavailable in this project; same-project only",
+  });
 
 const sameProjectParams = Effect.fn("McpToolAccess.sameProjectParams")(function* (
   name: string,
-  params: SameProjectParams,
+  params: object,
+  result = false,
 ) {
-  if (process.env.T3CODE_MCP_SAME_PROJECT_ONLY !== "1") return params;
-  const scope = yield* McpInvocationContext.McpInvocationContext;
-  if (scope.thread === undefined) return params;
-  const context = yield* loadCaller();
-  const projectId = context.caller!.projectId;
-  const targets = [params, params.target, ...(params.threads ?? []).map((thread) => thread.target)];
-  for (const target of targets) {
-    if (target === undefined) continue;
-    if (PeerForwarding.remoteTarget(scope, target.environmentId) !== undefined) {
-      return yield* new OrchestratorMcpFailure({
-        code: "capability_denied",
-        message: "Threads cannot access another environment; same-project only",
-      });
+  const boundary = yield* ProjectAccess.ProjectAccessScope;
+  if (boundary === undefined) return params;
+  const context = yield* loadCaller().pipe(Effect.mapError(sameProjectDenied));
+  if (context.caller?.projectId !== boundary.projectId) return yield* sameProjectDenied();
+  const scope = context.scope;
+  const projectId = boundary.projectId;
+  const scoped =
+    name === "t3_thread_list" || name === "t3_thread_search" || name === "list_scheduled_tasks"
+      ? { ...params, projectId, allProjects: false }
+      : params;
+  const checkedThreads = new Set<string>();
+  const assertThread = Effect.fn("McpToolAccess.sameProjectThread")(function* (id: string) {
+    if (checkedThreads.has(id)) return;
+    const shell = yield* context.threads
+      .getThreadShell(ThreadId.make(id))
+      .pipe(Effect.mapError(sameProjectDenied));
+    if (shell === null || shell.deletedAt !== null || shell.projectId !== projectId)
+      return yield* sameProjectDenied();
+    checkedThreads.add(id);
+  });
+  const assertTask = Effect.fn("McpToolAccess.sameProjectTask")(function* (
+    id: string,
+    scheduled: boolean,
+  ) {
+    const scheduler = yield* Effect.serviceOption(ScheduledTasks.ScheduledTaskService);
+    if (Option.isSome(scheduler)) {
+      const { tasks } = yield* scheduler.value.list().pipe(Effect.mapError(sameProjectDenied));
+      const task = tasks.find((task) => task.id === id);
+      if (task !== undefined) {
+        if (task.projectId !== projectId) return yield* sameProjectDenied();
+        if (task.threadId !== null) yield* assertThread(task.threadId);
+        return;
+      }
     }
-  }
-  // Scope the query before pagination, including explicit foreign-project and allProjects queries.
-  if (name === "t3_thread_list" || name === "t3_thread_search") {
-    return { ...params, projectId, allProjects: false };
-  }
-  for (const target of targets) {
-    if (target?.projectId !== undefined && target.projectId !== projectId) {
-      return yield* new OrchestratorMcpFailure({
-        code: "capability_denied",
-        message: `Project ${target.projectId} is another project; same-project only`,
-      });
+    if (scheduled) return yield* sameProjectDenied();
+    const parent = yield* context.threads
+      .getThreadRecords(boundary.callerThreadId, ["subagents"])
+      .pipe(Effect.mapError(sameProjectDenied));
+    const task = parent.subagents.find(
+      (task) => task.id === id || task.nativeTaskRef?.nativeId === id,
+    );
+    if (task === undefined || task.remoteChild !== undefined) return yield* sameProjectDenied();
+    if (task.childThreadId !== null) yield* assertThread(task.childThreadId);
+  });
+  // Resolve references recursively, including nested batch targets; new tools inherit this check.
+  const check = Effect.fn("McpToolAccess.sameProjectReferences")(function* (
+    value: unknown,
+  ): Effect.fn.Return<void, OrchestratorMcpFailure> {
+    if (Array.isArray(value)) {
+      for (const item of value) yield* check(item);
+    } else if (typeof value === "object" && value !== null) {
+      for (const [key, target] of Object.entries(value)) {
+        if (target === undefined || target === null) continue;
+        if (key === "scratch" && target === true) return yield* sameProjectDenied();
+        if (key === "environmentId") {
+          if (
+            typeof target !== "string" ||
+            PeerForwarding.remoteTarget(scope, target as EnvironmentId) !== undefined
+          )
+            return yield* sameProjectDenied();
+        } else if (key === "projectId") {
+          if (target !== projectId) return yield* sameProjectDenied();
+        } else if (/^(?:threadId|.*ThreadId)$/.test(key)) {
+          if (typeof target !== "string") return yield* sameProjectDenied();
+          yield* assertThread(target);
+        } else if (/^(?:threadIds|.*ThreadIds)$/.test(key)) {
+          if (!Array.isArray(target)) return yield* sameProjectDenied();
+          for (const id of target) {
+            if (typeof id !== "string") return yield* sameProjectDenied();
+            yield* assertThread(id);
+          }
+        } else if (!result && (key === "scheduledTaskId" || key === "taskId")) {
+          if (typeof target !== "string") return yield* sameProjectDenied();
+          yield* assertTask(target, key === "scheduledTaskId" || name === "run_scheduled_task_now");
+        } else if (!result && key === "taskIds") {
+          if (!Array.isArray(target)) return yield* sameProjectDenied();
+          for (const id of target) {
+            if (typeof id !== "string") return yield* sameProjectDenied();
+            yield* assertTask(id, false);
+          }
+        } else yield* check(target);
+      }
     }
-  }
-  if (params.scratch === true) {
-    return yield* new OrchestratorMcpFailure({
-      code: "capability_denied",
-      message: "Scratch launch chooses a separate project; same-project only",
-    });
-  }
-  if (params.threadId !== undefined && params.threadId !== scope.thread.threadId) {
-    const target = yield* context.threads
-      .getThreadShell(params.threadId)
-      .pipe(Effect.mapError(unavailable));
-    if (target !== null && target.projectId !== projectId) {
-      return yield* new OrchestratorMcpFailure({
-        code: "capability_denied",
-        message: `Thread ${params.threadId} is in another project; same-project only`,
-      });
-    }
-  }
-  return params;
+  });
+  yield* check(scoped);
+  return scoped;
 });
 
 /**
@@ -484,12 +508,44 @@ const routed = Effect.fn("McpToolAccess.routed")(function* <Tools extends Record
   }
   // Check before routing: forwarding replaces the thread caller with an external link credential.
   for (const name of Object.keys(handlers)) {
-    if (!sameProjectTools.has(name)) continue;
     const handle = handlers[name] as (
-      params: SameProjectParams,
+      params: object,
     ) => Effect.Effect<unknown, Tool.Failure<Tools[keyof Tools]>>;
-    handlers[name] = (params: SameProjectParams) =>
-      sameProjectParams(name, params).pipe(Effect.flatMap(handle));
+    handlers[name] = (params: object) =>
+      Effect.gen(function* () {
+        if (process.env.T3CODE_MCP_SAME_PROJECT_ONLY !== "1") return yield* handle(params);
+        const scope = yield* McpInvocationContext.McpInvocationContext;
+        if (scope.thread === undefined) return yield* handle(params);
+        const { caller } = yield* loadCaller().pipe(Effect.mapError(sameProjectDenied));
+        if (caller === undefined) return yield* sameProjectDenied();
+        const refused = yield* Ref.make(false);
+        return yield* sameProjectParams(name, params).pipe(
+          Effect.flatMap((scoped) =>
+            handle(scoped).pipe(
+              Effect.tap((result) =>
+                sameProjectParams("result", { arguments: scoped, result }, true),
+              ),
+            ),
+          ),
+          Effect.matchEffect({
+            onFailure: (error) =>
+              Ref.get(refused).pipe(
+                Effect.flatMap((denied) => Effect.fail(denied ? sameProjectDenied() : error)),
+              ),
+            onSuccess: (result) =>
+              Ref.get(refused).pipe(
+                Effect.flatMap((denied) =>
+                  denied ? Effect.fail(sameProjectDenied()) : Effect.succeed(result),
+                ),
+              ),
+          }),
+          Effect.provideService(ProjectAccess.ProjectAccessScope, {
+            projectId: caller.projectId,
+            callerThreadId: caller.id,
+            refused,
+          }),
+        );
+      });
   }
   return handlers as Toolkit.HandlersFrom<Tools>;
 });

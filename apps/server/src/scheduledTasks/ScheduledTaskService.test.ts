@@ -1,3 +1,5 @@
+import * as ProjectAccess from "../orchestration-v2/ProjectAccessScope.ts";
+import { liveThreadShell } from "../mcp/McpToolAccess.testkit.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as NodeUtil from "node:util";
 
@@ -613,6 +615,99 @@ it.effect("a run interrupted right after it reserves the task does not block the
       const second = yield* service.runNow({ id: task.id });
       assert.equal(second.threadId, ThreadId.make("thread:launched"));
       assert.equal(yield* Ref.get(launches), 1);
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
+
+it.effect("same-project scope rechecks task rows and bound threads at scheduler effects", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("project:test");
+    const foreign = ProjectId.make("project:foreign");
+    const caller = ThreadId.make("caller");
+    const bound = ThreadId.make("bound");
+    const boundProject = yield* Ref.make(projectId);
+    const layer = ScheduledTaskService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          ManagedPolicy.layerTest(),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (id) =>
+              Ref.get(boundProject).pipe(
+                Effect.map((current) => ({
+                  ...liveThreadShell(id),
+                  projectId: id === caller ? projectId : current,
+                })),
+              ),
+            sendToThread: () => Effect.die("foreign binding must not receive a message"),
+          }),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+            namedProjectsRoot: "/projects",
+            isScratchProject: () => Effect.succeed(false),
+          }),
+          NodeCrypto.layer,
+          Layer.succeed(Scheduler.Scheduler, { register: () => Effect.void }),
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* ScheduledTaskService.ScheduledTaskService;
+      const input = {
+        id: ScheduledTaskId.make("guarded-task"),
+        title: "Task",
+        prompt: "Original",
+        enabled: true,
+        schedule: { type: "interval" as const, everyMs: 60000 },
+        projectId,
+        threadId: bound,
+        workspaceStrategy: { type: "root" as const },
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+        runtimeMode: "full-access" as const,
+        interactionMode: "default" as const,
+      };
+      yield* service.upsert(input);
+      yield* Ref.set(boundProject, foreign);
+      for (const operation of [
+        service.upsert({ ...input, prompt: "Changed" }).pipe(Effect.asVoid),
+        service.delete({ id: input.id }).pipe(Effect.asVoid),
+        service.runNow({ id: input.id }).pipe(Effect.asVoid),
+      ]) {
+        const refused = yield* Ref.make(false);
+        const result = yield* Effect.exit(
+          operation.pipe(
+            Effect.provideService(ProjectAccess.ProjectAccessScope, {
+              projectId,
+              callerThreadId: caller,
+              refused,
+            }),
+          ),
+        );
+        assert.isTrue(Exit.isFailure(result));
+        assert.isTrue(yield* Ref.get(refused));
+        const stored = (yield* service.list()).tasks;
+        assert.equal(stored[0]?.prompt, "Original");
+        assert.equal(stored[0]?.runCount, 0);
+      }
+      yield* Ref.set(boundProject, projectId);
+      const refused = yield* Ref.make(false);
+      const updated = yield* service.upsert({ ...input, prompt: "Allowed" }).pipe(
+        Effect.provideService(ProjectAccess.ProjectAccessScope, {
+          projectId,
+          callerThreadId: caller,
+          refused,
+        }),
+      );
+      assert.equal(updated.task.prompt, "Allowed");
+      yield* service.delete({ id: input.id }).pipe(
+        Effect.provideService(ProjectAccess.ProjectAccessScope, {
+          projectId,
+          callerThreadId: caller,
+          refused,
+        }),
+      );
+      assert.lengthOf((yield* service.list()).tasks, 0);
+      assert.isFalse(yield* Ref.get(refused));
     }).pipe(Effect.provide(layer));
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );

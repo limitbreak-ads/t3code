@@ -1,3 +1,4 @@
+import * as ProjectAccess from "../orchestration-v2/ProjectAccessScope.ts";
 import {
   CommandId,
   MessageId,
@@ -794,6 +795,25 @@ export const layer = Layer.effect(
         ),
     );
 
+    const assertTaskProject = Effect.fn("ScheduledTaskService.assertTaskProject")(function* (
+      task: Pick<ScheduledTask, "projectId" | "threadId"> | null,
+    ) {
+      const scope = yield* ProjectAccess.ProjectAccessScope;
+      if (scope === undefined) return;
+      let allowed = yield* ProjectAccess.allowsProject(task?.projectId);
+      for (const id of [scope.callerThreadId, task?.threadId]) {
+        if (id == null) continue;
+        const shell = yield* threadManagement
+          .getThreadShell(id)
+          .pipe(Effect.orElseSucceed(() => null));
+        allowed =
+          (yield* ProjectAccess.allowsProject(
+            shell?.deletedAt === null ? shell.projectId : undefined,
+          )) && allowed;
+      }
+      if (!allowed) return yield* taskError("same-project only");
+    });
+
     const runTask = Effect.fn("ScheduledTaskService.runTask")(function* (
       task: ScheduledTask,
       trigger: "scheduled" | "manual" | "webhook",
@@ -809,6 +829,7 @@ export const layer = Layer.effect(
       const run = Effect.gen(function* () {
         // Re-read stale poll snapshots so deleted, paused or postponed tasks cannot fire.
         const active = yield* findTask(task.id);
+        yield* assertTaskProject(active);
         if (active === null) {
           if (webhook !== undefined) {
             return yield* new WebhookDeliverySkipped({
@@ -1341,12 +1362,29 @@ export const layer = Layer.effect(
         lastRunError: existingTask?.lastRunError ?? null,
         runCount: existingTask?.runCount ?? 0,
       };
-      yield* saveTask(
+      const save = saveTask(
         task,
         input.requireExisting === true,
         scheduleUnchanged ? existingTask.schedule : null,
         webhook,
       );
+      // Authorization and persistence share a transaction, so rebinding cannot race an MCP edit.
+      if ((yield* ProjectAccess.ProjectAccessScope) === undefined) yield* save;
+      else
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              const current = yield* findTask(id);
+              if (current !== null || input.id !== undefined) yield* assertTaskProject(current);
+              yield* assertTaskProject(task);
+              yield* save;
+            }),
+          )
+          .pipe(
+            Effect.mapError((cause) =>
+              taskError("Could not save scheduled task.", { taskId: id, cause }),
+            ),
+          );
       yield* notifyChanged;
       return { task: (yield* findTask(id)) ?? task };
     });
@@ -1432,12 +1470,27 @@ export const layer = Layer.effect(
         { discard: true },
       );
 
-    const deleteTask: ScheduledTaskService["Service"]["delete"] = (input) =>
-      deleteRow(input.id).pipe(
-        Effect.andThen(forgetWebhookTask(input.id)),
-        Effect.andThen(notifyChanged),
-        Effect.as({ id: input.id }),
-      );
+    const deleteTask: ScheduledTaskService["Service"]["delete"] = Effect.fn(
+      "ScheduledTaskService.delete",
+    )(function* (input) {
+      if ((yield* ProjectAccess.ProjectAccessScope) === undefined) yield* deleteRow(input.id);
+      else
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* assertTaskProject(yield* findTask(input.id));
+              yield* deleteRow(input.id);
+            }),
+          )
+          .pipe(
+            Effect.mapError((cause) =>
+              taskError("Could not delete scheduled task.", { taskId: input.id, cause }),
+            ),
+          );
+      yield* forgetWebhookTask(input.id);
+      yield* notifyChanged;
+      return { id: input.id };
+    });
 
     const deleteForThread = Effect.fn("ScheduledTaskService.deleteForThread")(function* (
       threadId: ThreadId,

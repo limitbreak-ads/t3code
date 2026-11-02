@@ -11,7 +11,9 @@ import {
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 
+import * as ProjectAccess from "../orchestration-v2/ProjectAccessScope.ts";
 import type { OrchestratorV2Error } from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import { resolveInteractionMode, resolveRuntimeMode } from "./delegatedTaskModes.ts";
@@ -29,10 +31,22 @@ export const threadNotFound = Effect.fn("OrchestratorMcpService.threadNotFound")
 ) {
   const prefixed = ThreadId.make(`mcp:${threadId}`);
   const shell = yield* threads.getThreadShell(prefixed).pipe(Effect.orElseSucceed(() => null));
+  const invocation = Option.getOrUndefined(
+    yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext),
+  );
+  const caller =
+    process.env.T3CODE_MCP_SAME_PROJECT_ONLY === "1" && invocation?.thread !== undefined
+      ? yield* threads
+          .getThreadShell(invocation.thread.threadId)
+          .pipe(Effect.orElseSucceed(() => null))
+      : undefined;
   return yield* new OrchestratorMcpFailure({
     code: "thread_not_found",
     message:
-      shell === null || shell.deletedAt !== null
+      shell === null ||
+      shell.deletedAt !== null ||
+      (caller !== undefined &&
+        (caller === null || caller.deletedAt !== null || shell.projectId !== caller.projectId))
         ? message
         : `${message} Did you mean \`${prefixed}\`?`,
   });
@@ -185,6 +199,14 @@ export const readThread = Effect.fn("mcp.readThread")(function* <
   const context = yield* readCaller();
   const targetId = yield* resolveThreadId(context, threadId);
   const shell = yield* context.threads.getThreadShell(targetId).pipe(Effect.mapError(unavailable));
+  if (
+    !(yield* ProjectAccess.allowsProject(shell?.deletedAt === null ? shell.projectId : undefined))
+  ) {
+    return yield* new OrchestratorMcpFailure({
+      code: "capability_denied",
+      message: "The requested target is unavailable in this project; same-project only",
+    });
+  }
   if (shell === null || shell.deletedAt !== null) {
     return yield* threadNotFound(context.threads, targetId, "The thread was not found.");
   }

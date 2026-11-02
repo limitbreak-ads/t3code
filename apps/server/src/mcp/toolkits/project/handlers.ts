@@ -1,3 +1,4 @@
+import * as ProjectAccess from "../../../orchestration-v2/ProjectAccessScope.ts";
 import {
   CommandId,
   MessageId,
@@ -288,6 +289,16 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
   t3_project_list: McpToolAccess.reads((input) =>
     Effect.gen(function* () {
       const projects = yield* access;
+      const boundary = yield* ProjectAccess.ProjectAccessScope;
+      if (boundary !== undefined) {
+        const project = yield* projects
+          .getById(boundary.projectId)
+          .pipe(Effect.mapError(unavailable));
+        return {
+          projects: (input.cursor ?? 0) > 0 || Option.isNone(project) ? [] : [project.value],
+          nextCursor: null,
+        };
+      }
       // Identities are resolved: linked environments find this side's project by repository.
       return yield* projects
         .listPage({ cursor: input.cursor ?? 0, limit: input.limit ?? 20 })

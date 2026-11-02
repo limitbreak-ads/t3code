@@ -1,7 +1,9 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
   EnvironmentId,
+  EventId,
   OrchestratorMcpFailure,
   ProjectId,
   ProviderDriverKind,
@@ -19,6 +21,11 @@ import { DispatchModeLimit } from "../orchestration-v2/DispatchModeLimit.ts";
 import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
+import * as ProjectAccess from "../orchestration-v2/ProjectAccessScope.ts";
+import * as ScheduledTasks from "../scheduledTasks/ScheduledTaskService.ts";
+import * as ThreadSearch from "../orchestration-v2/ThreadSearch.ts";
+import { liveThreadShell } from "./McpToolAccess.testkit.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
@@ -40,6 +47,7 @@ const adapter = {
 const layerDatabase = SqlitePersistence.layerMemory;
 const layerOrchestrator = Layer.mergeAll(
   layerDatabase,
+  ProjectStore.layer.pipe(Layer.provide(layerDatabase)),
   ProjectionStore.layer.pipe(Layer.provide(layerDatabase)),
   ProviderReplayHarness.layerWithRegistry(
     { name: "mcp-mode-race" },
@@ -187,5 +195,128 @@ it.layer(layerOrchestrator)("writesThreads against a mode raise", (it) => {
         ),
       ),
     ),
+  );
+});
+
+it.layer(layerOrchestrator)("production project move race", (it) => {
+  it.effect.each([false, true])(
+    "checks the project under the dispatch lock after preflight: moved=%s",
+    (moved) =>
+      Effect.gen(function* () {
+        const previous = process.env.T3CODE_MCP_SAME_PROJECT_ONLY;
+        process.env.T3CODE_MCP_SAME_PROJECT_ONLY = "1";
+        try {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const threads = yield* ThreadManagement.ThreadManagementService;
+          const projects = yield* ProjectStore.ProjectStoreV2;
+          const callerId = ThreadId.make(`caller:${moved}`);
+          const targetId = ThreadId.make(`target:${moved}`);
+          const ownProject = ProjectId.make("project:mcp-race");
+          const foreignProject = ProjectId.make(`foreign:${moved}`);
+          for (const projectId of [ownProject, foreignProject]) {
+            const at = "2026-03-24T00:00:00.000Z";
+            yield* projects.apply({
+              sequence: 1,
+              eventId: EventId.make(`create:${projectId}`),
+              aggregateKind: "project",
+              aggregateId: projectId,
+              occurredAt: at,
+              commandId: null,
+              causationEventId: null,
+              correlationId: null,
+              metadata: {},
+              type: "project.created",
+              payload: {
+                projectId,
+                title: "Project",
+                workspaceRoot: "/workspace",
+                defaultModelSelection: null,
+                scripts: [],
+                createdAt: at,
+                updatedAt: at,
+              },
+            });
+          }
+          yield* createSupervisedThread(callerId);
+          yield* createSupervisedThread(targetId);
+          let dispatched = false;
+          const intercepted = ThreadManagement.ThreadManagementService.of({
+            ...threads,
+            getThreadShell: (id) =>
+              id === callerId
+                ? Effect.succeed({ ...liveThreadShell(callerId), projectId: ownProject })
+                : threads.getThreadShell(id),
+            dispatch: (command) =>
+              Effect.gen(function* () {
+                dispatched = true;
+                if (moved)
+                  yield* orchestrator
+                    .dispatch({
+                      type: "thread.project.adopt-folder",
+                      commandId: CommandId.make(`move:${targetId}`),
+                      threadId: targetId,
+                      projectId: foreignProject,
+                    })
+                    .pipe(
+                      Effect.provideService(ProjectAccess.ProjectAccessScope, undefined),
+                      Effect.provideService(DispatchModeLimit, undefined),
+                    );
+                return yield* threads.dispatch(command);
+              }),
+          });
+          const result = yield* McpServer.McpServer.pipe(
+            Effect.flatMap((server) =>
+              server.callTool({
+                name: "t3_thread_organize",
+                arguments: { threadId: targetId, action: "pin" },
+              }),
+            ),
+            Effect.provideService(McpInvocationContext.McpInvocationContext, {
+              ...supervisedClient,
+              client: undefined,
+              thread: {
+                threadId: callerId,
+                providerInstanceId: instanceId,
+                providerSessionId: "session",
+              },
+            }),
+            Effect.provideService(McpSchema.McpServerClient, mcpClient),
+            Effect.provide(
+              McpHttpServer.layerThreadToolkit.pipe(
+                Layer.provideMerge(McpServer.McpServer.layer),
+                Layer.provide(Layer.succeed(ThreadManagement.ThreadManagementService, intercepted)),
+                Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
+                Layer.provide(Layer.mock(ScheduledTasks.ScheduledTaskService)({})),
+                Layer.provide(NodeCrypto.layer),
+              ),
+            ),
+          );
+          assert.equal(dispatched, true);
+          assert.equal(result.isError, moved);
+          const shell = yield* threads.getThreadShell(targetId);
+          assert.equal(shell?.projectId, moved ? foreignProject : ownProject);
+          if (moved) {
+            const content = result.content[0];
+            assert.equal(content?.type, "text");
+            if (content?.type === "text")
+              assert.deepEqual(JSON.parse(content.text), {
+                _tag: "OrchestratorMcpFailure",
+                code: "capability_denied",
+                message: "The requested target is unavailable in this project; same-project only",
+              });
+            assert.equal(shell?.pinnedAt == null, true);
+          } else assert.equal(shell?.pinnedAt != null, true);
+        } finally {
+          if (previous === undefined) delete process.env.T3CODE_MCP_SAME_PROJECT_ONLY;
+          else process.env.T3CODE_MCP_SAME_PROJECT_ONLY = previous;
+        }
+      }).pipe(
+        Effect.provide(
+          ThreadManagement.layer.pipe(
+            Layer.provide(ServerSettings.layerTest()),
+            Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
+          ),
+        ),
+      ),
   );
 });
