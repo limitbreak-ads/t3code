@@ -3,6 +3,7 @@ import {
   type OrchestrationV2LinkOrigin,
   OrchestratorMcpEnvironmentTarget,
   OrchestratorMcpFailure,
+  type ProjectId,
   type ProviderInteractionMode,
   type RuntimeMode,
   type ThreadId,
@@ -369,6 +370,82 @@ const linksUnavailable = new OrchestratorMcpFailure({
   message: "This environment cannot reach linked environments.",
 });
 
+const sameProjectTools = new Set([
+  "t3_thread_send",
+  "t3_thread_update",
+  "t3_thread_interrupt",
+  "t3_thread_read",
+  "t3_thread_list",
+  "t3_thread_search",
+  "t3_thread_wait",
+  "t3_thread_launch",
+  "create_threads",
+  "delegate_task",
+]);
+
+type ProjectTarget = {
+  readonly projectId?: ProjectId | undefined;
+  readonly environmentId?: EnvironmentId | undefined;
+};
+
+type SameProjectParams = ProjectTarget & {
+  readonly threadId?: ThreadId | undefined;
+  readonly scratch?: boolean | undefined;
+  readonly target?: ProjectTarget | undefined;
+  readonly threads?: ReadonlyArray<{ readonly target?: ProjectTarget | undefined }> | undefined;
+};
+
+const sameProjectParams = Effect.fn("McpToolAccess.sameProjectParams")(function* (
+  name: string,
+  params: SameProjectParams,
+) {
+  if (process.env.T3CODE_MCP_SAME_PROJECT_ONLY !== "1") return params;
+  const scope = yield* McpInvocationContext.McpInvocationContext;
+  if (scope.thread === undefined) return params;
+  const context = yield* loadCaller();
+  const projectId = context.caller!.projectId;
+  const targets = [params, params.target, ...(params.threads ?? []).map((thread) => thread.target)];
+  for (const target of targets) {
+    if (target === undefined) continue;
+    if (PeerForwarding.remoteTarget(scope, target.environmentId) !== undefined) {
+      return yield* new OrchestratorMcpFailure({
+        code: "capability_denied",
+        message: "Threads cannot access another environment; same-project only",
+      });
+    }
+  }
+  // Scope the query before pagination, including explicit foreign-project and allProjects queries.
+  if (name === "t3_thread_list" || name === "t3_thread_search") {
+    return { ...params, projectId, allProjects: false };
+  }
+  for (const target of targets) {
+    if (target?.projectId !== undefined && target.projectId !== projectId) {
+      return yield* new OrchestratorMcpFailure({
+        code: "capability_denied",
+        message: `Project ${target.projectId} is another project; same-project only`,
+      });
+    }
+  }
+  if (params.scratch === true) {
+    return yield* new OrchestratorMcpFailure({
+      code: "capability_denied",
+      message: "Scratch launch chooses a separate project; same-project only",
+    });
+  }
+  if (params.threadId !== undefined && params.threadId !== scope.thread.threadId) {
+    const target = yield* context.threads
+      .getThreadShell(params.threadId)
+      .pipe(Effect.mapError(unavailable));
+    if (target !== null && target.projectId !== projectId) {
+      return yield* new OrchestratorMcpFailure({
+        code: "capability_denied",
+        message: `Thread ${params.threadId} is in another project; same-project only`,
+      });
+    }
+  }
+  return params;
+});
+
 /**
  * Every tool that takes a linked environment runs there the same way: its
  * declaration checks the caller here, and the same call goes to the other
@@ -404,6 +481,15 @@ const routed = Effect.fn("McpToolAccess.routed")(function* <Tools extends Record
         if (Option.isNone(forwarding)) return yield* linksUnavailable;
         return yield* forwarding.value.call(scope, tool, target, { ...params, environmentId });
       });
+  }
+  // Check before routing: forwarding replaces the thread caller with an external link credential.
+  for (const name of Object.keys(handlers)) {
+    if (!sameProjectTools.has(name)) continue;
+    const handle = handlers[name] as (
+      params: SameProjectParams,
+    ) => Effect.Effect<unknown, Tool.Failure<Tools[keyof Tools]>>;
+    handlers[name] = (params: SameProjectParams) =>
+      sameProjectParams(name, params).pipe(Effect.flatMap(handle));
   }
   return handlers as Toolkit.HandlersFrom<Tools>;
 });
