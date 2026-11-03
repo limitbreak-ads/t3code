@@ -353,6 +353,7 @@ export const OrchestratorMcpThreadPullRequest = Schema.Struct({
 export type OrchestratorMcpThreadPullRequest = typeof OrchestratorMcpThreadPullRequest.Type;
 
 export const OrchestratorMcpThreadListItem = Schema.Struct({
+  redacted: Schema.optional(Schema.Boolean),
   threadId: ThreadId,
   projectId: ProjectId,
   title: Schema.String,
@@ -423,6 +424,7 @@ export const OrchestratorMcpThreadReadInput = Schema.Struct({
 export type OrchestratorMcpThreadReadInput = typeof OrchestratorMcpThreadReadInput.Type;
 
 export const OrchestratorMcpThreadDetail = Schema.Struct({
+  redacted: Schema.optional(Schema.Boolean),
   threadId: ThreadId,
   projectId: ProjectId,
   title: Schema.String,
@@ -469,16 +471,17 @@ export const OrchestratorMcpThreadRun = Schema.Struct({
 export type OrchestratorMcpThreadRun = typeof OrchestratorMcpThreadRun.Type;
 
 export const OrchestratorMcpThreadTimelineItem = Schema.Struct({
+  redacted: Schema.optional(Schema.Boolean),
   position: NonNegativeInt,
   visibility: Schema.Literals(["local", "inherited", "synthetic"]),
-  sourceThreadId: ThreadId,
+  sourceThreadId: Schema.NullOr(ThreadId),
   itemId: TurnItemId,
   subagentId: Schema.optional(NodeId),
   runId: Schema.NullOr(RunId),
   messageId: Schema.NullOr(MessageId),
   createdBy: Schema.NullOr(OrchestrationV2Actor),
   creationSource: Schema.NullOr(OrchestrationV2CreationSource),
-  senderThreadId: Schema.optional(ThreadId),
+  senderThreadId: Schema.optional(Schema.NullOr(ThreadId)),
   type: Schema.String,
   status: OrchestrationV2TurnItemStatus,
   title: Schema.NullOr(Schema.String),

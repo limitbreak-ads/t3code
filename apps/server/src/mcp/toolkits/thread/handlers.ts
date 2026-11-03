@@ -1,3 +1,4 @@
+import { auditOutputThreadReferences } from "../../sameProjectOutputs.ts";
 import {
   type CommandId,
   type RuntimeRequestId,
@@ -143,16 +144,28 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
     (input) => input.action === "status",
     McpToolAccess.reads((input) =>
       Effect.gen(function* () {
-        const { projection } = yield* readThread(input.threadId, ["contextTransfers"]);
+        const { threads, projection } = yield* readThread(input.threadId, ["contextTransfers"]);
+        const audit = yield* auditOutputThreadReferences(
+          threads,
+          projection.contextTransfers.flatMap((transfer) => [
+            transfer.sourceThreadId,
+            transfer.targetThreadId,
+          ]),
+        );
+        const transfers = projection.contextTransfers.filter(
+          (transfer) =>
+            audit.allows(transfer.sourceThreadId) && audit.allows(transfer.targetThreadId),
+        );
         return {
-          transfers: projection.contextTransfers.map(
-            ({ id, sourceThreadId, targetThreadId, status }) => ({
-              id,
-              sourceThreadId,
-              targetThreadId,
-              status,
-            }),
-          ),
+          ...(audit.scoped
+            ? { omittedCount: projection.contextTransfers.length - transfers.length }
+            : {}),
+          transfers: transfers.map(({ id, sourceThreadId, targetThreadId, status }) => ({
+            id,
+            sourceThreadId,
+            targetThreadId,
+            status,
+          })),
         };
       }),
     ),

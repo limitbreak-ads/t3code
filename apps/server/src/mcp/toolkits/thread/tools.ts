@@ -177,6 +177,7 @@ const ThreadTransferTool = Tool.make("t3_thread_transfer", {
   success: Schema.Union([
     Schema.Struct({ sequence: NonNegativeInt, targetThreadId: ThreadId }),
     Schema.Struct({
+      omittedCount: Schema.optional(NonNegativeInt),
       transfers: Schema.Array(
         Schema.Struct({
           id: OrchestrationV2ContextTransfer.fields.id,

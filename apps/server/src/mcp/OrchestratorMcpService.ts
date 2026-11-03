@@ -1,3 +1,4 @@
+import { auditOutputThreadReferences } from "./sameProjectOutputs.ts";
 import * as ProjectAccess from "../orchestration-v2/ProjectAccessScope.ts";
 import {
   CommandId,
@@ -2983,10 +2984,19 @@ const make = Effect.gen(function* () {
       const limit = input.limit ?? DEFAULT_THREAD_LIST_LIMIT;
       const page = filtered.slice(cursor, cursor + limit);
       const nextCursor = cursor + page.length < filtered.length ? cursor + page.length : null;
+      const audit = yield* auditOutputThreadReferences(
+        threadManagement,
+        page.map((shell) => shell.lineage.parentThreadId),
+      );
       return {
         projectId,
         currentThreadId: parent?.thread.id ?? null,
-        threads: page.map((shell) => listItemFromShell(scope, shell, nowMs)),
+        threads: page.map((shell) => {
+          const item = listItemFromShell(scope, shell, nowMs);
+          return audit.allows(item.parentThreadId)
+            ? item
+            : { ...item, parentThreadId: null, redacted: true };
+        }),
         nextCursor,
         total: filtered.length,
       } satisfies OrchestratorMcpThreadListResult;
@@ -3006,8 +3016,13 @@ const make = Effect.gen(function* () {
         })
         .pipe(Effect.mapError(threadManagementFailure));
       const page = timeline.items;
+      const sourceAudit = yield* auditOutputThreadReferences(
+        threadManagement,
+        page.map((row) => row.sourceThreadId),
+      );
       const messageIdsByThread = new Map<ThreadId, Array<MessageId>>();
       for (const row of page) {
+        if (!sourceAudit.allows(row.sourceThreadId)) continue;
         if (row.item.type !== "user_message" && row.item.type !== "assistant_message") continue;
         const ids = messageIdsByThread.get(row.sourceThreadId) ?? [];
         ids.push(row.item.messageId);
@@ -3077,26 +3092,38 @@ const make = Effect.gen(function* () {
           }
         }
       }
+      const detail = threadDetail(
+        scope,
+        target,
+        timeline.totalItems,
+        shell,
+        yield* Clock.currentTimeMillis,
+      );
+      const items = page.map((row) =>
+        timelineItem({
+          row,
+          maxChars,
+          messagesByThreadId,
+          ...(input.itemId === undefined ? {} : { textOffset: input.textOffset ?? 0 }),
+        }),
+      );
+      const audit = yield* auditOutputThreadReferences(threadManagement, [
+        detail.parentThreadId,
+        ...items.flatMap((item) => [item.sourceThreadId, item.senderThreadId]),
+      ]);
       return {
-        thread: threadDetail(
-          scope,
-          target,
-          timeline.totalItems,
-          shell,
-          yield* Clock.currentTimeMillis,
-        ),
+        thread: audit.allows(detail.parentThreadId)
+          ? detail
+          : { ...detail, parentThreadId: null, redacted: true },
         recentRuns: target.runs
           .toSorted((left, right) => right.ordinal - left.ordinal)
           .slice(0, input.runLimit ?? DEFAULT_THREAD_RUN_LIMIT)
           .map(threadRun),
-        items: page.map((row) =>
-          timelineItem({
-            row,
-            maxChars,
-            messagesByThreadId,
-            ...(input.itemId === undefined ? {} : { textOffset: input.textOffset ?? 0 }),
-          }),
-        ),
+        items: items.map((item) => ({
+          ...item,
+          ...(audit.allows(item.sourceThreadId) ? {} : { sourceThreadId: null, redacted: true }),
+          ...(audit.allows(item.senderThreadId) ? {} : { senderThreadId: null, redacted: true }),
+        })),
         nextPosition: page.at(-1)?.position ?? null,
         hasMore: timeline.hasMore,
       } satisfies OrchestratorMcpThreadReadResult;
