@@ -2,6 +2,7 @@ import { expect, it } from "@effect/vitest";
 import {
   ContextTransferId,
   MessageId,
+  NodeId,
   TurnItemId,
   ThreadId,
   type OrchestrationV2ContextTransfer,
@@ -185,6 +186,99 @@ it.effect.each([foreign.id, missing, deleted.id, sibling.id])(
       });
       if (redacted) expect(JSON.stringify(result)).not.toContain(reference);
       else expect(result).toEqual(baseline);
+    }).pipe(Effect.provide(f.layer));
+  },
+);
+
+it.effect.each(
+  (["fork", "thread_created"] as const).flatMap((type) =>
+    [foreign.id, missing, deleted.id, sibling.id].map((targetThreadId) => ({
+      type,
+      targetThreadId,
+    })),
+  ),
+)(
+  "production activity/direct-item read audits $type target $targetThreadId",
+  ({ type, targetThreadId }) => {
+    const itemId = TurnItemId.make("activity-item");
+    const base = {
+      id: itemId,
+      threadId: own.id,
+      runId: null,
+      nodeId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 0,
+      status: "completed" as const,
+      title: null,
+      startedAt: null,
+      completedAt: null,
+      updatedAt: own.updatedAt,
+      targetThreadId,
+    };
+    const item =
+      type === "fork"
+        ? { ...base, type, source: { type: "node" as const, nodeId: NodeId.make("source-node") } }
+        : {
+            ...base,
+            type,
+            providerThreadId: null,
+            targetRunId: null,
+            targetProviderInstanceId: own.modelSelection.instanceId,
+            targetModel: own.modelSelection.model,
+          };
+    const f = fixture(own, {
+      timeline: [
+        { position: 0, visibility: "local", sourceThreadId: own.id, sourceItemId: itemId, item },
+      ],
+    });
+    const originalText =
+      type === "fork"
+        ? `Forked to thread ${targetThreadId}.`
+        : `Created thread ${targetThreadId} with ${own.modelSelection.instanceId} (${own.modelSelection.model}).`;
+    const redacted = targetThreadId !== sibling.id;
+    const safeText = !redacted
+      ? originalText
+      : type === "fork"
+        ? "Forked to a thread outside this project."
+        : "Created a thread outside this project.";
+    return Effect.gen(function* () {
+      for (const selection of [{ view: "activity" }, { itemId }]) {
+        const args = { threadId: own.id, ...selection };
+        const baseline = yield* withToggle(undefined, call("t3_thread_read", args));
+        expect(baseline.isError).toBe(false);
+        expect(baseline.structuredContent).toMatchObject({ items: [{ text: originalText }] });
+        expect(yield* withToggle("0", call("t3_thread_read", args))).toEqual(baseline);
+        expect(yield* withToggle("1", call("t3_thread_read", args, true))).toEqual(baseline);
+        const result = yield* withToggle("1", call("t3_thread_read", args));
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          items: [{ text: safeText, ...(redacted ? { redacted: true } : {}) }],
+        });
+        if (redacted) expect(JSON.stringify(result)).not.toContain(targetThreadId);
+        else expect(result).toEqual(baseline);
+      }
+      const paged = yield* withToggle(
+        "1",
+        call("t3_thread_read", {
+          threadId: own.id,
+          itemId,
+          textOffset: 12,
+          maxCharsPerItem: 20,
+        }),
+      );
+      expect(paged.isError).toBe(false);
+      expect(paged.structuredContent).toMatchObject({
+        items: [
+          {
+            text: safeText.slice(12, 32),
+            textTruncated: safeText.length > 32,
+            nextTextOffset: safeText.length > 32 ? 32 : null,
+            ...(redacted ? { redacted: true } : {}),
+          },
+        ],
+      });
     }).pipe(Effect.provide(f.layer));
   },
 );

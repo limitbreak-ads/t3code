@@ -883,7 +883,7 @@ function jsonText(value: unknown): string {
   }
 }
 
-function turnItemText(item: OrchestrationV2TurnItem): string | null {
+function turnItemText(item: OrchestrationV2TurnItem, redactTarget = false): string | null {
   switch (item.type) {
     case "notification":
       return [item.summary, item.detail].filter((part) => part !== undefined).join("\n");
@@ -934,9 +934,13 @@ function turnItemText(item: OrchestrationV2TurnItem): string | null {
     case "handoff":
       return item.summary ?? `${item.strategy} handoff to ${item.toProviderInstanceId}`;
     case "fork":
-      return `Forked to thread ${item.targetThreadId}.`;
+      return redactTarget
+        ? "Forked to a thread outside this project."
+        : `Forked to thread ${item.targetThreadId}.`;
     case "thread_created":
-      return `Created thread ${item.targetThreadId} with ${item.targetProviderInstanceId} (${item.targetModel}).`;
+      return redactTarget
+        ? "Created a thread outside this project."
+        : `Created thread ${item.targetThreadId} with ${item.targetProviderInstanceId} (${item.targetModel}).`;
     case "secret_request":
       return `Asked the user for ${item.label}: ${item.secretStatus}.`;
     case "link_request":
@@ -963,9 +967,10 @@ function timelineItem(input: {
   readonly row: OrchestrationV2ThreadProjection["visibleTurnItems"][number];
   readonly maxChars: number;
   readonly textOffset?: number;
+  readonly redactTarget?: boolean;
   readonly messagesByThreadId: ReadonlyMap<ThreadId, OrchestrationV2ThreadProjection["messages"]>;
 }): OrchestratorMcpThreadTimelineItem {
-  const text = turnItemText(input.row.item);
+  const text = turnItemText(input.row.item, input.redactTarget);
   const offset = input.textOffset ?? 0;
   const end = textPageEnd(text, offset, input.maxChars);
   const textTruncated = text !== null && text.length > end;
@@ -980,6 +985,7 @@ function timelineItem(input: {
           .get(input.row.sourceThreadId)
           ?.find((candidate) => candidate.id === messageId);
   return {
+    ...(input.redactTarget ? { redacted: true } : {}),
     position: input.row.position,
     visibility: input.row.visibility,
     sourceThreadId: input.row.sourceThreadId,
@@ -3016,13 +3022,18 @@ const make = Effect.gen(function* () {
         })
         .pipe(Effect.mapError(threadManagementFailure));
       const page = timeline.items;
-      const sourceAudit = yield* auditOutputThreadReferences(
+      const timelineAudit = yield* auditOutputThreadReferences(
         threadManagement,
-        page.map((row) => row.sourceThreadId),
+        page.flatMap((row) => [
+          row.sourceThreadId,
+          ...(row.item.type === "fork" || row.item.type === "thread_created"
+            ? [row.item.targetThreadId]
+            : []),
+        ]),
       );
       const messageIdsByThread = new Map<ThreadId, Array<MessageId>>();
       for (const row of page) {
-        if (!sourceAudit.allows(row.sourceThreadId)) continue;
+        if (!timelineAudit.allows(row.sourceThreadId)) continue;
         if (row.item.type !== "user_message" && row.item.type !== "assistant_message") continue;
         const ids = messageIdsByThread.get(row.sourceThreadId) ?? [];
         ids.push(row.item.messageId);
@@ -3102,6 +3113,9 @@ const make = Effect.gen(function* () {
       const items = page.map((row) =>
         timelineItem({
           row,
+          redactTarget:
+            (row.item.type === "fork" || row.item.type === "thread_created") &&
+            !timelineAudit.allows(row.item.targetThreadId),
           maxChars,
           messagesByThreadId,
           ...(input.itemId === undefined ? {} : { textOffset: input.textOffset ?? 0 }),
